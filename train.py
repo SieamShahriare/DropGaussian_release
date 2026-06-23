@@ -85,6 +85,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         ssim_value = ssim(image, gt_image)
         loss = Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
         
+        # --- PHYSICAL ANISOTROPY PENALTY ---
+        scales = torch.exp(gaussians._scaling) 
+        ratio = scales.max(dim=1).values / (scales.min(dim=1).values + 1e-6)
+        L_aniso = 1e-3 * torch.clamp(ratio - 10.0, min=0).mean()
+        loss = loss + L_aniso
+        
         loss.backward()
         iter_end.record()
 
