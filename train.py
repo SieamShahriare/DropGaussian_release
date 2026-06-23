@@ -32,7 +32,7 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, tau_aniso, lambda_aniso):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -88,7 +88,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # --- PHYSICAL ANISOTROPY PENALTY ---
         scales = torch.exp(gaussians._scaling) 
         ratio = scales.max(dim=1).values / (scales.min(dim=1).values + 1e-6)
-        L_aniso = 1e-3 * torch.clamp(ratio - 10.0, min=0).mean()
+        L_aniso = lambda_aniso * torch.clamp(ratio - tau_aniso, min=0).mean()
         loss = loss + L_aniso
         
         loss.backward()
@@ -214,6 +214,11 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    
+    # Custom Hyperparameters for Physical Anisotropy Penalty
+    parser.add_argument("--tau_aniso", type=float, default=10.0, help="Threshold for Anisotropy Penalty")
+    parser.add_argument("--lambda_aniso", type=float, default=1e-3, help="Weight for Anisotropy Penalty")
+
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -225,7 +230,9 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    
+    # Pass our newly parsed arguments natively into the training loop!
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.tau_aniso, args.lambda_aniso)
 
     # All done
     print("\nTraining complete.")
