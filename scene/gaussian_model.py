@@ -113,7 +113,41 @@ class GaussianModel:
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
-    
+
+    @property
+    def get_sh_freq_ratio(self):
+        """
+        SH-FGD: Per-Gaussian Spherical Harmonic Frequency Ratio.
+
+        Computes the fraction of total SH energy carried by the higher-degree
+        (view-dependent) coefficients versus the degree-0 (diffuse) coefficient.
+
+            freq_ratio[i] = rest_energy[i] / (dc_energy[i] + rest_energy[i] + eps)
+
+        Interpretation:
+            ~0.0  →  Gaussian is nearly perfectly diffuse / low-frequency.
+                     This is the statistical signature of co-adapted floaters
+                     (large, semi-transparent Gaussians that cancel each other's
+                     erroneous colours from the training viewpoints).
+            ~1.0  →  Gaussian carries strong view-dependent detail.
+                     This is the signature of correctly-placed surface Gaussians.
+
+        Used in train.py to assign per-Gaussian dropout probabilities:
+            drop_prob[i] = lambda_shfgd * (1.0 - freq_ratio[i])
+        So low-frequency Gaussians get high dropout; surface Gaussians are left alone.
+
+        Notes:
+          - Both tensors are detached before the norm: SH-FGD is a *routing signal*,
+            not a learned objective. We don't want gradients flowing back through
+            this ratio and reshaping the SH feature landscape.
+          - _features_dc  shape: [N, 1, 3]
+          - _features_rest shape: [N, 15, 3]  (for sh_degree=3, the default)
+        """
+        dc_energy   = self._features_dc.detach().norm(dim=-1).squeeze(1)   # [N]
+        rest_energy = self._features_rest.detach().norm(dim=(1, 2))         # [N]
+        total       = dc_energy + rest_energy + 1e-6
+        return rest_energy / total                                           # [N] in [0, 1]
+
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 
@@ -375,7 +409,7 @@ class GaussianModel:
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
-        selected_pts_mask = torch.logical_and(selected_pts_mask,    # self.percent_dense = 0.01
+        selected_pts_mask = torch.logical_and(selected_pts_mask,
                             torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
         
         new_xyz = self._xyz[selected_pts_mask]
@@ -406,4 +440,3 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
-

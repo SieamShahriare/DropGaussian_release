@@ -32,7 +32,11 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, tau_aniso, lambda_aniso):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations,
+             checkpoint_iterations, checkpoint, debug_from,
+             tau_aniso, lambda_aniso,
+             lambda_shfgd, shfgd_start_iter, shfgd_end_iter):
+
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -58,6 +62,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     bg_mask = None
     loss_accum = 0
     pseudo_stack = None
+
+    # Log the active SH-FGD config once at startup
+    if lambda_shfgd > 0:
+        print(f"\n[SH-FGD] Enabled  |  lambda={lambda_shfgd}  |  active iters [{shfgd_start_iter}, {shfgd_end_iter})")
+    else:
+        print("\n[SH-FGD] Disabled (lambda_shfgd=0)")
+
     for iteration in range(first_iter, opt.iterations + 1):        
         iter_start.record()
 
@@ -78,20 +89,77 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             pipe.debug = True
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, is_train=True, iteration=iteration)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
-        Ll1 = l1_loss(image, gt_image)
-        ssim_value = ssim(image, gt_image)
-        loss = Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
-        
-        # --- PHYSICAL ANISOTROPY PENALTY ---
-        scales = torch.exp(gaussians._scaling) 
-        ratio = scales.max(dim=1).values / (scales.min(dim=1).values + 1e-6)
-        L_aniso = lambda_aniso * torch.clamp(ratio - tau_aniso, min=0).mean()
-        loss = loss + L_aniso
-        
-        loss.backward()
+        # -----------------------------------------------------------------------
+        # SH-FGD: Spherical Harmonic Frequency-Gated Dropout
+        #
+        # We want to stochastically silence low-frequency Gaussians (floaters)
+        # during training. The mechanism:
+        #
+        #   1. Compute freq_ratio[i] ∈ [0,1] per Gaussian — the fraction of
+        #      total SH energy in higher-degree coefficients.
+        #      Low value ≈ diffuse / floater profile (validated in Cell 9).
+        #
+        #   2. Assign drop_prob[i] = lambda_shfgd * (1 - freq_ratio[i])
+        #      → Low-freq Gaussians get drop probability up to lambda_shfgd.
+        #      → High-freq surface Gaussians get near-zero drop probability.
+        #
+        #   3. Sample a binary keep-mask via Bernoulli.
+        #
+        #   4. Temporarily set _opacity of dropped Gaussians to -10.0
+        #      (sigmoid(-10) ≈ 4.5e-5, effectively invisible).
+        #      This patches the raw nn.Parameter .data directly — it does NOT
+        #      participate in autograd and is fully restored after loss.backward().
+        #
+        # Why .data patching instead of a wrapper?
+        #   render() calls gaussians.get_opacity internally and we don't own that
+        #   call site. Patching .data is the minimal-invasive zero-dependency hook.
+        #   The restore happens unconditionally in a try/finally block so a crash
+        #   mid-backward can never leave the model in a corrupted state.
+        #
+        # Why detach in get_sh_freq_ratio?
+        #   The ratio is a routing signal, not a learned objective. Letting
+        #   gradients flow through it would silently reshape the SH landscape
+        #   in uncontrolled ways.
+        # -----------------------------------------------------------------------
+        _opacity_backup = None
+        shfgd_active = (lambda_shfgd > 0 and shfgd_start_iter <= iteration < shfgd_end_iter)
+
+        if shfgd_active:
+            with torch.no_grad():
+                freq_ratio = gaussians.get_sh_freq_ratio          # [N] in [0, 1]
+                drop_prob  = lambda_shfgd * (1.0 - freq_ratio)    # [N] in [0, lambda_shfgd]
+                keep_mask  = torch.bernoulli(1.0 - drop_prob)     # [N] binary: 1=keep, 0=drop
+                _opacity_backup = gaussians._opacity.data.clone()
+                gaussians._opacity.data[keep_mask == 0] = -10.0
+
+        try:
+            render_pkg = render(viewpoint_cam, gaussians, pipe, bg, is_train=True, iteration=iteration)
+            image, viewspace_point_tensor, visibility_filter, radii = (
+                render_pkg["render"],
+                render_pkg["viewspace_points"],
+                render_pkg["visibility_filter"],
+                render_pkg["radii"],
+            )
+
+            Ll1 = l1_loss(image, gt_image)
+            ssim_value = ssim(image, gt_image)
+            loss = Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+
+            # --- PHYSICAL ANISOTROPY PENALTY ---
+            scales  = torch.exp(gaussians._scaling)
+            ratio   = scales.max(dim=1).values / (scales.min(dim=1).values + 1e-6)
+            L_aniso = lambda_aniso * torch.clamp(ratio - tau_aniso, min=0).mean()
+            loss    = loss + L_aniso
+
+            loss.backward()
+
+        finally:
+            # Always restore _opacity — even if an exception was raised mid-backward.
+            # This guarantees the nn.Parameter is never left in the suppressed state.
+            if _opacity_backup is not None:
+                gaussians._opacity.data = _opacity_backup
+
         iter_end.record()
 
         with torch.no_grad():
@@ -157,7 +225,6 @@ def prepare_output_and_logger(args):
 
 def training_report(args, tb_writer, iteration, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
     if tb_writer:
-        # tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
@@ -209,15 +276,28 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[5000, 10000,])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[5000, 10000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[10000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
-    parser.add_argument("--start_checkpoint", type=str, default = None)
-    
-    # Custom Hyperparameters for Physical Anisotropy Penalty
-    parser.add_argument("--tau_aniso", type=float, default=10.0, help="Threshold for Anisotropy Penalty")
-    parser.add_argument("--lambda_aniso", type=float, default=1e-3, help="Weight for Anisotropy Penalty")
+    parser.add_argument("--start_checkpoint", type=str, default=None)
+
+    # --- Physical Anisotropy Penalty ---
+    parser.add_argument("--tau_aniso", type=float, default=20.0,
+                        help="Anisotropy ratio threshold (winner from sweep)")
+    parser.add_argument("--lambda_aniso", type=float, default=1e-3,
+                        help="Anisotropy penalty weight (winner from sweep)")
+
+    # --- SH-FGD: Spherical Harmonic Frequency-Gated Dropout ---
+    parser.add_argument("--lambda_shfgd", type=float, default=0.5,
+                        help="Max per-Gaussian dropout probability for lowest-freq Gaussians. "
+                             "0.0 = disabled. Recommended starting point: 0.5")
+    parser.add_argument("--shfgd_start_iter", type=int, default=1000,
+                        help="Iteration to begin SH-FGD. Default 1000 lets initial "
+                             "densification stabilize before dropout kicks in.")
+    parser.add_argument("--shfgd_end_iter", type=int, default=25000,
+                        help="Iteration to stop SH-FGD. Default 25000 lets the model "
+                             "coast to clean convergence in the final 5k iters.")
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -230,9 +310,15 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    
-    # Pass our newly parsed arguments natively into the training loop!
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.tau_aniso, args.lambda_aniso)
+
+    training(
+        lp.extract(args), op.extract(args), pp.extract(args),
+        args.test_iterations, args.save_iterations,
+        args.checkpoint_iterations, args.start_checkpoint,
+        args.debug_from,
+        args.tau_aniso, args.lambda_aniso,
+        args.lambda_shfgd, args.shfgd_start_iter, args.shfgd_end_iter,
+    )
 
     # All done
     print("\nTraining complete.")
