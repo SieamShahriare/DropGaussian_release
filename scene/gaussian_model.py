@@ -40,7 +40,6 @@ class GaussianModel:
 
         self.rotation_activation = torch.nn.functional.normalize
 
-
     def __init__(self, sh_degree : int):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
@@ -56,6 +55,7 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        self.current_iteration = 0
         self.setup_functions()
 
     def capture(self):
@@ -118,30 +118,8 @@ class GaussianModel:
     def get_sh_freq_ratio(self):
         """
         SH-FGD: Per-Gaussian Spherical Harmonic Frequency Ratio.
-
-        Computes the fraction of total SH energy carried by the higher-degree
-        (view-dependent) coefficients versus the degree-0 (diffuse) coefficient.
-
-            freq_ratio[i] = rest_energy[i] / (dc_energy[i] + rest_energy[i] + eps)
-
-        Interpretation:
-            ~0.0  →  Gaussian is nearly perfectly diffuse / low-frequency.
-                     This is the statistical signature of co-adapted floaters
-                     (large, semi-transparent Gaussians that cancel each other's
-                     erroneous colours from the training viewpoints).
-            ~1.0  →  Gaussian carries strong view-dependent detail.
-                     This is the signature of correctly-placed surface Gaussians.
-
-        Used in train.py to assign per-Gaussian dropout probabilities:
-            drop_prob[i] = lambda_shfgd * (1.0 - freq_ratio[i])
-        So low-frequency Gaussians get high dropout; surface Gaussians are left alone.
-
-        Notes:
-          - Both tensors are detached before the norm: SH-FGD is a *routing signal*,
-            not a learned objective. We don't want gradients flowing back through
-            this ratio and reshaping the SH feature landscape.
-          - _features_dc  shape: [N, 1, 3]
-          - _features_rest shape: [N, 15, 3]  (for sh_degree=3, the default)
+        0.0 = purely diffuse / low-frequency (floater profile)
+        1.0 = purely high-frequency / view-dependent (surface detail profile)
         """
         dc_energy   = self._features_dc.detach().norm(dim=-1).squeeze(1)   # [N]
         rest_energy = self._features_rest.detach().norm(dim=(1, 2))         # [N]
@@ -171,6 +149,9 @@ class GaussianModel:
         rots[:, 0] = 1
 
         opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+
+        # PAGD: Initialize birth iteration tracker for original points
+        self._birth_iter = torch.zeros((fused_point_cloud.shape[0],), dtype=torch.long, device="cuda")
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
@@ -202,6 +183,7 @@ class GaussianModel:
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
+        self.current_iteration = iteration # Track current iteration for PAGD
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "xyz":
                 lr = self.xyz_scheduler_args(iteration)
@@ -210,7 +192,6 @@ class GaussianModel:
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
-        # All channels except the 3 DC
         for i in range(self._features_dc.shape[1]*self._features_dc.shape[2]):
             l.append('f_dc_{}'.format(i))
         for i in range(self._features_rest.shape[1]*self._features_rest.shape[2]):
@@ -265,7 +246,6 @@ class GaussianModel:
         features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
         for idx, attr_name in enumerate(extra_f_names):
             features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
-        # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
         features_extra = features_extra.reshape((features_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1))
 
         scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
@@ -334,9 +314,12 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
-
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+
+        # PAGD: Prune birth iteration tracker
+        if hasattr(self, '_birth_iter'): 
+            self._birth_iter = self._birth_iter[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -376,6 +359,13 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
+        # PAGD: Update birth iteration tracker for newly densified points
+        num_new = new_xyz.shape[0]
+        new_birth = torch.full((num_new,), self.current_iteration, dtype=torch.long, device="cuda")
+        if not hasattr(self, '_birth_iter'):
+            self._birth_iter = torch.zeros(self.get_xyz.shape[0] - num_new, dtype=torch.long, device="cuda")
+        self._birth_iter = torch.cat([self._birth_iter, new_birth])
+
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
@@ -383,7 +373,6 @@ class GaussianModel:
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
-        # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
@@ -407,7 +396,6 @@ class GaussianModel:
         self.prune_points(prune_filter)
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
-        # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                             torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)

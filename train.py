@@ -35,7 +35,8 @@ except ImportError:
 def training(dataset, opt, pipe, testing_iterations, saving_iterations,
              checkpoint_iterations, checkpoint, debug_from,
              tau_aniso, lambda_aniso,
-             lambda_shfgd, shfgd_start_iter, shfgd_end_iter):
+             lambda_shfgd, shfgd_start_iter, shfgd_end_iter,
+             p_max_pagd, t_ramp_pagd):
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -63,73 +64,51 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
     loss_accum = 0
     pseudo_stack = None
 
-    # Log the active SH-FGD config once at startup
-    if lambda_shfgd > 0:
-        print(f"\n[SH-FGD] Enabled  |  lambda={lambda_shfgd}  |  active iters [{shfgd_start_iter}, {shfgd_end_iter})")
-    else:
-        print("\n[SH-FGD] Disabled (lambda_shfgd=0)")
+    if lambda_shfgd > 0 or p_max_pagd > 0:
+        print(f"\n[ROUTING] SH-FGD lambda={lambda_shfgd} | PAGD p_max={p_max_pagd}")
 
     for iteration in range(first_iter, opt.iterations + 1):        
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
 
-        # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
-        # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
         gt_image = viewpoint_cam.original_image.cuda()
 
-        # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        # -----------------------------------------------------------------------
-        # SH-FGD: Spherical Harmonic Frequency-Gated Dropout
-        #
-        # We want to stochastically silence low-frequency Gaussians (floaters)
-        # during training. The mechanism:
-        #
-        #   1. Compute freq_ratio[i] ∈ [0,1] per Gaussian — the fraction of
-        #      total SH energy in higher-degree coefficients.
-        #      Low value ≈ diffuse / floater profile (validated in Cell 9).
-        #
-        #   2. Assign drop_prob[i] = lambda_shfgd * (1 - freq_ratio[i])
-        #      → Low-freq Gaussians get drop probability up to lambda_shfgd.
-        #      → High-freq surface Gaussians get near-zero drop probability.
-        #
-        #   3. Sample a binary keep-mask via Bernoulli.
-        #
-        #   4. Temporarily set _opacity of dropped Gaussians to -10.0
-        #      (sigmoid(-10) ≈ 4.5e-5, effectively invisible).
-        #      This patches the raw nn.Parameter .data directly — it does NOT
-        #      participate in autograd and is fully restored after loss.backward().
-        #
-        # Why .data patching instead of a wrapper?
-        #   render() calls gaussians.get_opacity internally and we don't own that
-        #   call site. Patching .data is the minimal-invasive zero-dependency hook.
-        #   The restore happens unconditionally in a try/finally block so a crash
-        #   mid-backward can never leave the model in a corrupted state.
-        #
-        # Why detach in get_sh_freq_ratio?
-        #   The ratio is a routing signal, not a learned objective. Letting
-        #   gradients flow through it would silently reshape the SH landscape
-        #   in uncontrolled ways.
-        # -----------------------------------------------------------------------
+        # --- SH-FGD & PAGD COMBINED ROUTING ---
         _opacity_backup = None
         shfgd_active = (lambda_shfgd > 0 and shfgd_start_iter <= iteration < shfgd_end_iter)
+        pagd_active = (p_max_pagd > 0 and hasattr(gaussians, '_birth_iter'))
 
-        if shfgd_active:
+        if shfgd_active or pagd_active:
             with torch.no_grad():
-                freq_ratio = gaussians.get_sh_freq_ratio          # [N] in [0, 1]
-                drop_prob  = lambda_shfgd * (1.0 - freq_ratio)    # [N] in [0, lambda_shfgd]
-                keep_mask  = torch.bernoulli(1.0 - drop_prob)     # [N] binary: 1=keep, 0=drop
+                N = gaussians.get_xyz.shape[0]
+                combined_drop_prob = torch.zeros(N, device="cuda")
+                
+                # 1. Calculate SH-FGD Probabilities
+                if shfgd_active:
+                    freq_ratio = gaussians.get_sh_freq_ratio
+                    shfgd_prob = lambda_shfgd * (1.0 - freq_ratio)
+                    combined_drop_prob = torch.max(combined_drop_prob, shfgd_prob)
+                    
+                # 2. Calculate PAGD Probabilities
+                if pagd_active:
+                    age = iteration - gaussians._birth_iter
+                    pagd_prob = p_max_pagd * torch.exp(-age / t_ramp_pagd)
+                    combined_drop_prob = torch.max(combined_drop_prob, pagd_prob)
+                
+                # 3. Apply the Mask
+                keep_mask = torch.bernoulli(1.0 - combined_drop_prob)
                 _opacity_backup = gaussians._opacity.data.clone()
                 gaussians._opacity.data[keep_mask == 0] = -10.0
 
@@ -155,15 +134,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
             loss.backward()
 
         finally:
-            # Always restore _opacity — even if an exception was raised mid-backward.
-            # This guarantees the nn.Parameter is never left in the suppressed state.
             if _opacity_backup is not None:
                 gaussians._opacity.data = _opacity_backup
 
         iter_end.record()
 
         with torch.no_grad():
-            # Progress bar
             if iteration > opt.densify_from_iter:
                 loss_accum += loss.clone().detach().item()
 
@@ -174,13 +150,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            # Log and save
             training_report(dataset, tb_writer, iteration, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
-            # Densification
             if iteration < opt.densify_until_iter:
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
@@ -192,7 +166,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations,
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
-            # Optimizer step
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
@@ -209,13 +182,11 @@ def prepare_output_and_logger(args):
             unique_str = str(uuid.uuid4())
         args.model_path = os.path.join("./output/", unique_str[0:10])
         
-    # Set up output folder
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
 
-    # Create Tensorboard writer
     tb_writer = None
     if TENSORBOARD_FOUND:
         tb_writer = SummaryWriter(args.model_path)
@@ -228,7 +199,6 @@ def training_report(args, tb_writer, iteration, loss, l1_loss, elapsed, testing_
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
-    # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
@@ -267,7 +237,6 @@ def training_report(args, tb_writer, iteration, loss, l1_loss, elapsed, testing_
         torch.cuda.empty_cache()
 
 if __name__ == "__main__":
-    # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
@@ -289,25 +258,25 @@ if __name__ == "__main__":
                         help="Anisotropy penalty weight (winner from sweep)")
 
     # --- SH-FGD: Spherical Harmonic Frequency-Gated Dropout ---
-    parser.add_argument("--lambda_shfgd", type=float, default=0.5,
-                        help="Max per-Gaussian dropout probability for lowest-freq Gaussians. "
-                             "0.0 = disabled. Recommended starting point: 0.5")
+    parser.add_argument("--lambda_shfgd", type=float, default=0.0,
+                        help="Max per-Gaussian dropout probability for lowest-freq Gaussians. 0.0 = disabled.")
     parser.add_argument("--shfgd_start_iter", type=int, default=1000,
-                        help="Iteration to begin SH-FGD. Default 1000 lets initial "
-                             "densification stabilize before dropout kicks in.")
+                        help="Iteration to begin SH-FGD.")
     parser.add_argument("--shfgd_end_iter", type=int, default=25000,
-                        help="Iteration to stop SH-FGD. Default 25000 lets the model "
-                             "coast to clean convergence in the final 5k iters.")
+                        help="Iteration to stop SH-FGD.")
+
+    # --- PAGD: Primitive-Age-Gated Dropout ---
+    parser.add_argument("--p_max_pagd", type=float, default=0.0, 
+                        help="Max dropout prob for newborn primitives. 0.0 = disabled.")
+    parser.add_argument("--t_ramp_pagd", type=float, default=1500.0, 
+                        help="Iterations to decay PAGD to 0")
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
     print("Optimizing " + args.model_path)
 
-    # Initialize system state (RNG)
     safe_state(args.quiet)
-
-    # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
@@ -318,7 +287,7 @@ if __name__ == "__main__":
         args.debug_from,
         args.tau_aniso, args.lambda_aniso,
         args.lambda_shfgd, args.shfgd_start_iter, args.shfgd_end_iter,
+        args.p_max_pagd, args.t_ramp_pagd
     )
 
-    # All done
     print("\nTraining complete.")
